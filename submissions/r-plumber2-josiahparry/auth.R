@@ -8,7 +8,7 @@ test_val <- paste(
         jose::jwt_claim(
             sub = ulid::ulid(),
             username = "alice",
-            exp = Sys.time() + 60 * 5
+            exp = Sys.time() + 60 * 5000
         ),
         secret
     )
@@ -31,17 +31,20 @@ rook <- fiery::fake_request(
 request <- reqres::Request$new(rook)
 response <- reqres::Response$new(request)
 
+
 # returns the user claim
 authorize <- function(request, response, secret = Sys.getenv("JWT_SECRET")) {
     auth_header <- request$get_header("authorization")
     if (rlang::is_null(auth_header)) {
         response$status <- 401L
         response$body <- "missing bearer token"
+        return(response)
     }
 
     if (!startsWith(auth_header, "Bearer ")) {
         response$status <- 401L
         response$body <- "invalid or expired token"
+        return(response)
     }
 
     # extract the payload
@@ -54,6 +57,7 @@ authorize <- function(request, response, secret = Sys.getenv("JWT_SECRET")) {
     if (claim$exp < as.integer(Sys.time())) {
         response$status <- 401L
         response$body <- "invalid or expired token"
+        return(response)
     }
 
     claim

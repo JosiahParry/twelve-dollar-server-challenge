@@ -32,9 +32,6 @@ health <- function(con) {
 }
 
 
-user <- authorize(request, response, secret)
-
-
 post_select <- "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) as like_count FROM posts p JOIN users u ON u.id = p.user_id"
 post_query <- sprintf("%s where p.id = ?", post_select)
 feed_sql <- sprintf(
@@ -63,13 +60,16 @@ get_feed <- function(con) {
 
 
 create_post <- function(con, user_id, body) {
+  message(sprintf("user_id: %s", user_id))
+  message(sprintf("body: %s", body))
   resp <- read_adbc(
     con,
     "INSERT INTO posts (user_id, body) VALUES (?, ?) RETURNING id, created_at",
     bind = data.frame(user_id = user_id, body = body)
   ) |>
     as.data.frame()
-  get_post(con, resp$id)
+  message(yyjsonr::write_json_str(resp))
+  get_post(con, as.integer(resp$id))
 }
 
 library(plumber2)
@@ -82,7 +82,10 @@ yyjsonr_serializing <- function(...) {
 
 register_serializer("json", yyjsonr_serializing, "application/json")
 
-api() |>
+source("submissions/r-plumber2-josiahparry/auth.R")
+
+r <- api() |>
+  api_logger(logger_console()) |>
   api_get(
     "/health",
     \() {
@@ -95,8 +98,14 @@ api() |>
   api_get("/posts/<id:integer>", \(id) {
     get_post(con, id)
   }) |>
+  api_post("/posts", \(request, response, body) {
+    user <- authorize(request, response, secret = secret)
+    if (is.null(user$sub)) {
+      return(list(error = "missing bearer token"))
+    }
+    create_post(con, user$sub, body$body)
+  }) |>
   api_run(block = TRUE)
-# FEED_SQL = POST_SELECT + " ORDER BY p.created_at DESC, p.id DESC LIMIT 20"
 
 ## Endpoints
 
