@@ -1,10 +1,24 @@
 library(yyjsonr)
+library(plumber2)
 library(adbcdrivermanager)
+
+# load our auth handlers
+source("auth.R")
+
+
+# we use yyjsonr for serializing our json always
+yyjsonr_serializing <- function(...) {
+  function(x) {
+    write_json_str(x, auto_unbox = TRUE)
+  }
+}
+
+register_serializer("json", yyjsonr_serializing, "application/json")
 
 # Open a new connection to a database
 db <- adbc_database_init(
   adbcsqlite::adbcsqlite(),
-  uri = "seed/feed.db"
+  uri = Sys.getenv("SQLITE_PATH", unset = "seed/feed.db")
 )
 
 con <- adbc_connection_init(db)
@@ -32,22 +46,27 @@ health <- function(con) {
 }
 
 
-post_select <- "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) as like_count FROM posts p JOIN users u ON u.id = p.user_id"
+post_select <- "SELECT p.id, p.body, p.created_at, u.username as author, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) as like_count FROM posts p JOIN users u ON u.id = p.user_id"
 post_query <- sprintf("%s where p.id = ?", post_select)
 feed_sql <- sprintf(
   "%s order by p.created_at desc, p.id desc limit 20",
   post_select
 )
+insert_like <- "INSERT INTO likes (user_id, post_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM posts WHERE id = ?2) ON CONFLICT (user_id, post_id) DO NOTHING RETURNING post_id"
 
-
-get_post <- function(con, id) {
+get_post <- function(con, id, response) {
   resp <- read_adbc(con, post_query, bind = data.frame(id = id)) |>
-    as.data.frame() |>
-    unclass()
+    as.data.frame()
+
+  if (nrow(resp) == 0L) {
+    response$status <- 404L
+    return(list(error = "post not found"))
+  }
+
   # need to coerce to integer because R doesn't support i64 😭
   resp$id <- as.integer(resp$id)
   resp$like_count <- as.integer(resp$like_count)
-  list(post = resp)
+  list(post = unclass(resp))
 }
 
 get_feed <- function(con) {
@@ -59,7 +78,7 @@ get_feed <- function(con) {
 }
 
 
-create_post <- function(con, user_id, body) {
+create_post <- function(con, user_id, body, response) {
   message(sprintf("user_id: %s", user_id))
   message(sprintf("body: %s", body))
   resp <- read_adbc(
@@ -69,20 +88,72 @@ create_post <- function(con, user_id, body) {
   ) |>
     as.data.frame()
   message(yyjsonr::write_json_str(resp))
-  get_post(con, as.integer(resp$id))
+  get_post(con, as.integer(resp$id), response)
 }
 
-library(plumber2)
+like_post <- function(request, response, id) {
+  id <- validate_post_id(id, response)
+  if (is.list(id)) {
+    return(id)
+  }
+  # authorize the user
+  user <- authorize(request, response, secret = secret)
+  if (is.null(user$sub)) {
+    return(user)
+  }
 
-yyjsonr_serializing <- function(...) {
-  function(x) {
-    write_json_str(x, auto_unbox = TRUE)
+  # try inserting the like, return an error if we one.
+  res <- rlang::try_fetch(
+    read_adbc(con, insert_like, bind = data.frame(user$sub, id)),
+    error = \(err) {
+      response$status <- 404L
+      list(error = "post not found")
+    }
+  )
+
+  if (!is.null(res$error)) {
+    return(res)
+  }
+
+  resp <- as.data.frame(res)
+
+  # when we have no rows that could be a missing post OR the post doesn't exist
+  if (nrow(resp) == 0) {
+    does_it_exist <- as.data.frame(read_adbc(
+      con,
+      "SELECT 1 FROM posts WHERE id = ?",
+      bind = data.frame(id = id)
+    ))
+
+    if (nrow(does_it_exist) == 0L) {
+      response$status <- 404L
+      return(list(error = "post not found"))
+    }
+
+    response$status <- 200L
+    return(list(liked = TRUE, already_liked = TRUE, post_id = id))
+  }
+
+  response$status <- 201L
+  list(liked = TRUE, already_liked = FALSE, post_id = id)
+}
+
+
+validate_post_id <- function(id, response) {
+  id <- rlang::try_fetch(as.numeric(id), warning = \(cnd) {
+    response$status <- 400L
+    list(error = "invalid post id")
+  })
+
+  if (is.list(id)) {
+    return(id)
+  }
+
+  if (!rlang::is_integerish(id) || id < 1L) {
+    response$status <- 400L
+    return(list(error = "invalid post id"))
   }
 }
-
-register_serializer("json", yyjsonr_serializing, "application/json")
-
-source("submissions/r-plumber2-josiahparry/auth.R")
 
 r <- api() |>
   api_logger(logger_console()) |>
@@ -95,17 +166,28 @@ r <- api() |>
   api_get("/feed", \() {
     get_feed(con)
   }) |>
-  api_get("/posts/<id:integer>", \(id) {
-    get_post(con, id)
+  api_get("/posts/<id>", \(response, id) {
+    id <- validate_post_id(id, response)
+    if (is.list(id)) {
+      return(id)
+    }
+    get_post(con, as.integer(id), response)
   }) |>
   api_post("/posts", \(request, response, body) {
     user <- authorize(request, response, secret = secret)
     if (is.null(user$sub)) {
-      return(list(error = "missing bearer token"))
+      return(user)
     }
-    create_post(con, user$sub, body$body)
+
+    res <- create_post(con, user$sub, body$body, response)
+    response$status <- 201L
+    res
   }) |>
-  api_run(block = TRUE)
+  api_post("/posts/<id>/like", like_post) |>
+  api_run(
+    host = Sys.getenv("HOST", "127.0.0.1"),
+    port = as.integer(Sys.getenv("PORT", "8080"))
+  )
 
 ## Endpoints
 

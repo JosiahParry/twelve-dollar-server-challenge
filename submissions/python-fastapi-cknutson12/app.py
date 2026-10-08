@@ -4,6 +4,7 @@ Every handler is `async def` and calls SQLite inline on the event loop. The quer
 index lookups that finish in well under a millisecond, so handing them to a threadpool would
 only add a thread hop per request on a machine that has a single core anyway.
 """
+
 import base64
 import gc
 import hashlib
@@ -27,11 +28,15 @@ MAX_ID = 2**63 - 1  # SQLite's INTEGER range; larger ids cannot exist
 
 # Autocommit (isolation_level=None): every INSERT is its own transaction, committed before
 # execute()/fetchall() returns, so a 201 is only sent for a committed row.
-db = sqlite3.connect(SQLITE_PATH, isolation_level=None, check_same_thread=False, cached_statements=32)
+db = sqlite3.connect(
+    SQLITE_PATH, isolation_level=None, check_same_thread=False, cached_statements=32
+)
 db.execute("PRAGMA journal_mode = WAL")
 db.execute("PRAGMA synchronous = NORMAL")  # rule 6: WAL + NORMAL
 db.execute("PRAGMA busy_timeout = 5000")
-db.execute("PRAGMA mmap_size = 1073741824")  # read the file through the OS page cache, no copies
+db.execute(
+    "PRAGMA mmap_size = 1073741824"
+)  # read the file through the OS page cache, no copies
 db.execute("PRAGMA cache_size = -65536")  # 64 MiB
 db.execute("PRAGMA temp_store = MEMORY")
 
@@ -42,7 +47,9 @@ SELECT p.id, p.body, p.created_at, u.username,
 """
 FEED_SQL = POST_SELECT + " ORDER BY p.created_at DESC, p.id DESC LIMIT 20"
 POST_SQL = POST_SELECT + " WHERE p.id = ?"
-INSERT_POST_SQL = "INSERT INTO posts (user_id, body) VALUES (?, ?) RETURNING id, created_at"
+INSERT_POST_SQL = (
+    "INSERT INTO posts (user_id, body) VALUES (?, ?) RETURNING id, created_at"
+)
 # Inserts only if the post exists; 0 changes means "already liked" or "no such post".
 INSERT_LIKE_SQL = """
 INSERT INTO likes (user_id, post_id)
@@ -55,7 +62,9 @@ POST_EXISTS_SQL = "SELECT 1 FROM posts WHERE id = ?"
 
 
 def json_response(status: int, data) -> Response:
-    return Response(orjson.dumps(data), status_code=status, media_type="application/json")
+    return Response(
+        orjson.dumps(data), status_code=status, media_type="application/json"
+    )
 
 
 def error(status: int, message: str) -> Response:
@@ -63,7 +72,13 @@ def error(status: int, message: str) -> Response:
 
 
 def post_object(row) -> dict:
-    return {"id": row[0], "body": row[1], "created_at": row[2], "author": row[3], "like_count": row[4]}
+    return {
+        "id": row[0],
+        "body": row[1],
+        "created_at": row[2],
+        "author": row[3],
+        "like_count": row[4],
+    }
 
 
 def parse_id(raw: str):
@@ -95,7 +110,9 @@ def authenticate(request: Request):
         head = orjson.loads(b64url_decode(head_b64))
         if not isinstance(head, dict) or head.get("alg") != "HS256":
             raise ValueError("alg")
-        digest = hmac.new(JWT_SECRET, f"{head_b64}.{payload_b64}".encode(), hashlib.sha256).digest()
+        digest = hmac.new(
+            JWT_SECRET, f"{head_b64}.{payload_b64}".encode(), hashlib.sha256
+        ).digest()
         expected = base64.urlsafe_b64encode(digest).rstrip(b"=")
         if not hmac.compare_digest(expected, sig_b64.encode()):
             raise ValueError("signature")
@@ -104,12 +121,19 @@ def authenticate(request: Request):
             raise ValueError("payload")
         now = int(time.time())
         exp = payload.get("exp")
-        if exp is not None and (not isinstance(exp, (int, float)) or isinstance(exp, bool) or now >= exp):
+        if exp is not None and (
+            not isinstance(exp, (int, float)) or isinstance(exp, bool) or now >= exp
+        ):
             raise ValueError("exp")
         nbf = payload.get("nbf")
-        if nbf is not None and (not isinstance(nbf, (int, float)) or isinstance(nbf, bool) or now < nbf):
+        if nbf is not None and (
+            not isinstance(nbf, (int, float)) or isinstance(nbf, bool) or now < nbf
+        ):
             raise ValueError("nbf")
-    except (ValueError, UnicodeError):  # includes orjson.JSONDecodeError and binascii.Error
+    except (
+        ValueError,
+        UnicodeError,
+    ):  # includes orjson.JSONDecodeError and binascii.Error
         return error(401, "invalid or expired token")
     sub = payload.get("sub")
     username = payload.get("username")
@@ -121,7 +145,7 @@ def authenticate(request: Request):
 
 # JavaScript's String.prototype.trim() set (WhiteSpace + LineTerminator), so bodies are trimmed
 # exactly like the reference implementations.
-WHITESPACE = "\t\n\v\f\r                  　﻿"
+WHITESPACE = "\t\n\v\f\r                　﻿"
 
 # --- app --------------------------------------------------------------------------------------
 
@@ -145,8 +169,12 @@ async def health():
     try:
         db.execute("SELECT 1").fetchone()
     except Exception as exc:
-        return json_response(503, {"status": "degraded", "db": "unreachable", "error": str(exc)})
-    return json_response(200, {"status": "ok", "db": "ok", "uptime_s": int(time.monotonic() - START)})
+        return json_response(
+            503, {"status": "degraded", "db": "unreachable", "error": str(exc)}
+        )
+    return json_response(
+        200, {"status": "ok", "db": "ok", "uptime_s": int(time.monotonic() - START)}
+    )
 
 
 @app.get("/feed")
@@ -188,7 +216,15 @@ async def create_post(request: Request):
     post_id, created_at = db.execute(INSERT_POST_SQL, (user_id, body)).fetchall()[0]
     return json_response(
         201,
-        {"post": {"id": post_id, "body": body, "created_at": created_at, "author": username, "like_count": 0}},
+        {
+            "post": {
+                "id": post_id,
+                "body": body,
+                "created_at": created_at,
+                "author": username,
+                "like_count": 0,
+            }
+        },
     )
 
 
@@ -202,9 +238,13 @@ async def like_post(post_id: str, request: Request):
         return error(400, "invalid post id")
     if pid <= MAX_ID:
         if db.execute(INSERT_LIKE_SQL, (user[0], pid)).rowcount == 1:
-            return json_response(201, {"liked": True, "already_liked": False, "post_id": pid})
+            return json_response(
+                201, {"liked": True, "already_liked": False, "post_id": pid}
+            )
         if db.execute(POST_EXISTS_SQL, (pid,)).fetchone() is not None:
-            return json_response(200, {"liked": True, "already_liked": True, "post_id": pid})
+            return json_response(
+                200, {"liked": True, "already_liked": True, "post_id": pid}
+            )
     return error(404, "post not found")
 
 
