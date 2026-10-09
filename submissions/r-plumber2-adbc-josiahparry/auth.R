@@ -1,3 +1,6 @@
+# # I used claude to create a fake authorization header to test with here: prompt
+# # >"can you look at the app.py and see what an example authorization header would look like?       ""\
+# # TODO fetch the secret from JWT_SECRET env var
 # secret <- charToRaw("dev-secret")
 # test_val <- paste(
 #     "Bearer",

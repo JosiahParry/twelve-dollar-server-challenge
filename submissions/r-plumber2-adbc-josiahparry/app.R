@@ -1,16 +1,6 @@
-library(DBI)
 library(yyjsonr)
 library(plumber2)
-
-# define the query strings
-post_select <- "SELECT p.id, p.body, p.created_at, u.username as author, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) as like_count FROM posts p JOIN users u ON u.id = p.user_id"
-post_query <- sprintf("%s where p.id = ?", post_select)
-feed_sql <- sprintf(
-  "%s order by p.created_at desc, p.id desc limit 20",
-  post_select
-)
-insert_like <- "INSERT INTO likes (user_id, post_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM posts WHERE id = ?2) ON CONFLICT (user_id, post_id) DO NOTHING RETURNING post_id"
-
+library(adbcdrivermanager)
 
 # load our auth handlers
 source("auth.R")
@@ -37,24 +27,17 @@ yyjsonr_parsing <- function(...) {
 register_parser("json", yyjsonr_parsing, "application/json")
 
 # Open a new connection to a database
-con <- dbConnect(
-  RSQLite::SQLite(),
-  Sys.getenv("SQLITE_PATH", unset = "seed/feed.db"),
-  bigint = "integer"
+db <- adbc_database_init(
+  adbcsqlite::adbcsqlite(),
+  uri = Sys.getenv("SQLITE_PATH", unset = "seed/feed.db")
 )
 
-# added for parity with the python example
-dbExecute(con, "PRAGMA journal_mode = WAL")
-dbExecute(con, "PRAGMA synchronous = NORMAL")
-dbExecute(con, "PRAGMA busy_timeout = 5000")
-dbExecute(con, "PRAGMA mmap_size = 1073741824")
-dbExecute(con, "PRAGMA cache_size = -65536")
-dbExecute(con, "PRAGMA temp_store = MEMORY")
+con <- adbc_connection_init(db)
 
 start <- Sys.time()
 
 health <- function(con) {
-  res <- rlang::try_fetch(dbGetQuery(con, "select 1"), error = function(cnd) {
+  res <- rlang::try_fetch(read_adbc(con, "select 1"), error = function(cnd) {
     list(
       status = "degraded",
       "db" = "unreachable",
@@ -62,7 +45,7 @@ health <- function(con) {
     )
   })
 
-  if (is.data.frame(res)) {
+  if (rlang::inherits_only(res, "nanoarrow_array_stream")) {
     list(
       "status" = "ok",
       "db" = "ok",
@@ -74,29 +57,49 @@ health <- function(con) {
 }
 
 
+post_select <- "SELECT p.id, p.body, p.created_at, u.username as author, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) as like_count FROM posts p JOIN users u ON u.id = p.user_id"
+post_query <- sprintf("%s where p.id = ?", post_select)
+feed_sql <- sprintf(
+  "%s order by p.created_at desc, p.id desc limit 20",
+  post_select
+)
+insert_like <- "INSERT INTO likes (user_id, post_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM posts WHERE id = ?2) ON CONFLICT (user_id, post_id) DO NOTHING RETURNING post_id"
+
 get_post <- function(con, id, response) {
-  resp <- dbGetQuery(con, post_query, params = list(id))
+  resp <- read_adbc(con, post_query, bind = data.frame(id = id)) |>
+    as.data.frame()
 
   if (nrow(resp) == 0L) {
     response$status <- 404L
     return(list(error = "post not found"))
   }
 
+  # need to coerce to integer because R doesn't support i64 😭
+  resp$id <- as.integer(resp$id)
+  resp$like_count <- as.integer(resp$like_count)
   list(post = unclass(resp))
 }
 
 get_feed <- function(con) {
-  list(posts = dbGetQuery(con, feed_sql))
+  resp <- read_adbc(con, feed_sql) |>
+    as.data.frame()
+  resp$id <- as.integer(resp$id)
+  resp$like_count <- as.integer(resp$like_count)
+  list(posts = resp)
 }
 
 
 create_post <- function(con, user_id, body, response) {
-  resp <- dbGetQuery(
+  message(sprintf("user_id: %s", user_id))
+  message(sprintf("body: %s", body))
+  resp <- read_adbc(
     con,
     "INSERT INTO posts (user_id, body) VALUES (?, ?) RETURNING id, created_at",
-    params = list(user_id, body)
-  )
-  get_post(con, resp$id, response)
+    bind = data.frame(user_id = user_id, body = body)
+  ) |>
+    as.data.frame()
+  message(yyjsonr::write_json_str(resp))
+  get_post(con, as.integer(resp$id), response)
 }
 
 like_post <- function(request, response, id) {
@@ -113,7 +116,7 @@ like_post <- function(request, response, id) {
 
   # try inserting the like, return an error if we one.
   res <- rlang::try_fetch(
-    dbGetQuery(con, insert_like, params = list(user$sub, id)),
+    read_adbc(con, insert_like, bind = data.frame(user$sub, id)),
     error = \(err) {
       response$status <- 404L
       list(error = "post not found")
@@ -124,13 +127,15 @@ like_post <- function(request, response, id) {
     return(res)
   }
 
+  resp <- as.data.frame(res)
+
   # when we have no rows that could be a missing post OR the post doesn't exist
-  if (nrow(res) == 0) {
-    does_it_exist <- dbGetQuery(
+  if (nrow(resp) == 0) {
+    does_it_exist <- as.data.frame(read_adbc(
       con,
       "SELECT 1 FROM posts WHERE id = ?",
-      params = list(id)
-    )
+      bind = data.frame(id = id)
+    ))
 
     if (nrow(does_it_exist) == 0L) {
       response$status <- 404L
@@ -222,3 +227,13 @@ r <- api() |>
     host = Sys.getenv("HOST", "127.0.0.1"),
     port = as.integer(Sys.getenv("PORT", "8080"))
   )
+
+## Endpoints
+
+# | Request | Success | Body |
+# |---|---|---|
+# | `GET /health` | 200 | `{"status":"ok","db":"ok","uptime_s":<int>}` after a `SELECT 1` succeeds. If it fails: 503 `{"status":"degraded","db":"unreachable","error":<string>}` |
+# | `GET /feed` | 200 | `{"posts":[<post> × 20]}`: the 20 newest posts, `ORDER BY created_at DESC, id DESC` |
+# | `GET /posts/:id` | 200 | `{"post":<post>}` |
+# | `POST /posts` (auth) | 201 | `{"post":{"id":…,"body":<trimmed body>,"created_at":…,"author":<token username>,"like_count":0}}`. Request body: `{"body":"..."}` |
+# | `POST /posts/:id/like` (auth) | 201 first time, 200 on repeats | `{"liked":true,"already_liked":<bool>,"post_id":<int>}`. One like per (user, post) |
