@@ -10,9 +10,7 @@
 #         secret
 #     )
 # )
-
-# # verify token isn't expired
-
+# verify token isn't expired
 # rook <- fiery::fake_request(
 #     url = 'http://www.example.com/summary?id=2347&user=Thomas+Lin+Pedersen',
 #     content = '{"name":["Thomas Lin Pedersen"],"age":[31],"homepage":["www.data-imaginist.com","www.github.com/thomasp85"]}',
